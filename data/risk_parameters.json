@@ -1,0 +1,5 @@
+{
+    "risk_reward_ratio": 2.0,
+    "max_risk_percentage": 1.0,
+    "confirm_trades": false
+}
