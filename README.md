@@ -125,11 +125,9 @@ The application connects to IB Gateway/TWS on `127.0.0.1:7497` by default. Host,
 ---
 
 ## Screenshots
-
-<!-- Add screenshots of the application here -->
-<!-- ![Trading Interface](docs/screenshots/trader.png) -->
-<!-- ![Position Manager](docs/screenshots/positions.png) -->
-<!-- ![Execution Logbook](docs/screenshots/logbook.png) -->
+[Trading Interface](docs/screenshots/Trading.jpeg)
+[Risk Manager](docs/screenshots/Risk_management.jpeg)
+[Execution Logbook](docs/screenshots/Logbook.jpeg)
 
 ---
 
