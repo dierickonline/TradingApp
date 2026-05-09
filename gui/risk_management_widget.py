@@ -1,27 +1,36 @@
 # gui/risk_management_widget.py
 """Risk management widget for setting trading risk parameters"""
 import logging
-import json
-import os
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QPushButton, QLineEdit, QGroupBox, QGridLayout,
                             QCheckBox, QSpacerItem, QSizePolicy, QMessageBox,
                             QDoubleSpinBox, QSpinBox)
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QFont
 
+from config import APP_CONFIG
+from core.persistence import atomic_write_json, load_versioned_settings
+
 logger = logging.getLogger(__name__)
+
+
+RISK_PARAMS_SCHEMA = 1
+
+DEFAULT_RISK_PARAMS = {
+    "risk_reward_ratio": 2.0,
+    "max_risk_percentage": 2.0,
+    "confirm_trades": True,
+}
 
 
 class RiskParametersWidget(QGroupBox):
     """Widget for risk management parameters"""
-    
+
     # Signals
     parameters_changed = pyqtSignal(dict)  # Emitted when parameters are saved
-    
+
     def __init__(self, parent=None):
         super().__init__("Risk Management Parameters", parent)
-        self.parameters_file = "data/risk_parameters.json"
         self.init_ui()
         self.load_parameters()
         
@@ -216,43 +225,29 @@ class RiskParametersWidget(QGroupBox):
             self.confirm_trades_checkbox.setChecked(params["confirm_trades"])
             
     def save_parameters(self):
-        """Save parameters to file"""
+        """Save parameters to file atomically."""
+        params = self.get_parameters()
+        payload = dict(params)
+        payload["__schema__"] = RISK_PARAMS_SCHEMA
         try:
-            # Create data directory if it doesn't exist
-            os.makedirs("data", exist_ok=True)
-            
-            # Get current parameters
-            params = self.get_parameters()
-            
-            # Save to JSON file
-            with open(self.parameters_file, "w") as f:
-                json.dump(params, f, indent=4)
-                
+            atomic_write_json(APP_CONFIG.risk_parameters_path, payload)
             logger.info(f"Risk parameters saved: {params}")
-            
-            # Emit signal
             self.parameters_changed.emit(params)
-            
-            # Show success message
             QMessageBox.information(self, "Success", "Risk parameters saved successfully!")
-            
-        except Exception as e:
+        except OSError as e:
             logger.error(f"Error saving risk parameters: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to save parameters: {str(e)}")
-            
+            QMessageBox.critical(self, "Error", f"Failed to save parameters: {e}")
+
     def load_parameters(self):
-        """Load parameters from file"""
-        try:
-            if os.path.exists(self.parameters_file):
-                with open(self.parameters_file, "r") as f:
-                    params = json.load(f)
-                    
-                self.set_parameters(params)
-                logger.info(f"Risk parameters loaded: {params}")
-                
-        except Exception as e:
-            logger.error(f"Error loading risk parameters: {e}")
-            # Use defaults if loading fails
+        """Load parameters from file with graceful fallback."""
+        params = load_versioned_settings(
+            APP_CONFIG.risk_parameters_path, DEFAULT_RISK_PARAMS, RISK_PARAMS_SCHEMA
+        )
+        # Strip the schema key before applying to the widget — set_parameters
+        # only knows about real parameter keys.
+        widget_params = {k: v for k, v in params.items() if not k.startswith("__")}
+        self.set_parameters(widget_params)
+        logger.info(f"Risk parameters loaded: {widget_params}")
             
     def reset_to_defaults(self):
         """Reset parameters to default values"""

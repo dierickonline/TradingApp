@@ -281,11 +281,15 @@ class PositionManager(QObject):
             if percentage == 100.0:
                 self._cancel_position_orders(symbol)
             
-            # Create a fresh contract to ensure all fields are properly set
+            # Create a fresh contract to ensure all fields are properly set.
+            # primaryExchange is copied from the position's IB-supplied
+            # contract — delayed-data accounts otherwise get an "ambiguous
+            # contract" rejection on SMART-only stock orders.
             contract = Contract()
             contract.symbol = position.contract.symbol
             contract.secType = "STK"
             contract.exchange = "SMART"
+            contract.primaryExchange = getattr(position.contract, 'primaryExchange', '') or ''
             contract.currency = "USD"
             
             # Create market order with proper settings for closing positions
@@ -311,10 +315,7 @@ class PositionManager(QObject):
             
             # Get a fresh order ID and ensure it's unique
             order_id = self.get_next_valid_order_id()
-            
-            # Get a fresh order ID and ensure it's unique
-            order_id = self.get_next_valid_order_id()
-            
+
             # Log detailed order info for debugging
             logger.info(f"Closing {percentage}% of {symbol} position:")
             logger.info(f"  Order ID: {order_id}")

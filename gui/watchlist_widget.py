@@ -1,13 +1,14 @@
 # gui/watchlist_widget.py
 """Watchlist widget for managing a list of ticker symbols"""
 import logging
-import json
-import os
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QPushButton, QLineEdit, QGroupBox, QListWidget,
                             QListWidgetItem, QMenu, QMessageBox)
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QAction
+
+from config import APP_CONFIG
+from core.persistence import atomic_write_json, safe_read_json
 
 logger = logging.getLogger(__name__)
 
@@ -186,34 +187,23 @@ class WatchlistWidget(QGroupBox):
             logger.info("Cleared entire watchlist")
                 
     def save_watchlist(self):
-        """Save watchlist to file"""
+        """Save watchlist to file atomically."""
+        path = APP_CONFIG.watchlist_path(self.filename)
         try:
-            # Create data directory if it doesn't exist
-            os.makedirs("data", exist_ok=True)
-            
-            tickers = self.get_tickers()
-            filepath = os.path.join("data", self.filename)
-            with open(filepath, "w") as f:
-                json.dump(tickers, f)
-                
-        except Exception as e:
-            logger.error(f"Error saving watchlist to {self.filename}: {e}")
-            
+            atomic_write_json(path, self.get_tickers())
+        except OSError as e:
+            logger.error(f"Error saving watchlist to {path}: {e}")
+
     def load_watchlist(self):
-        """Load watchlist from file"""
-        try:
-            filepath = os.path.join("data", self.filename)
-            with open(filepath, "r") as f:
-                tickers = json.load(f)
-                
-            for ticker in tickers:
+        """Load watchlist from file with graceful fallback to empty list."""
+        path = APP_CONFIG.watchlist_path(self.filename)
+        tickers = safe_read_json(path, default=[])
+        if not isinstance(tickers, list):
+            logger.warning(f"Watchlist {path} is not a JSON list; ignoring")
+            return
+        for ticker in tickers:
+            if isinstance(ticker, str):
                 self.list_widget.addItem(ticker)
-                
-        except FileNotFoundError:
-            # No saved watchlist yet
-            pass
-        except Exception as e:
-            logger.error(f"Error loading watchlist from {self.filename}: {e}")
             
     def set_enabled(self, enabled: bool):
         """Enable or disable the watchlist widget"""

@@ -1,9 +1,7 @@
 # core/order_manager.py
 """Order manager for handling IB order operations"""
 import logging
-from typing import Dict, Optional
 from PyQt6.QtCore import QObject, pyqtSignal
-from ibapi.contract import Contract
 from ibapi.order import Order
 
 logger = logging.getLogger(__name__)
@@ -16,15 +14,20 @@ class OrderManager(QObject):
     order_status_update = pyqtSignal(int, str, float, float, float, str)  # orderId, status, filled, remaining, avgFillPrice, permId
     order_error = pyqtSignal(str)  # error message
     
-    def __init__(self, ib_app=None):
+    def __init__(self, ib_app=None, contract_resolver=None):
         super().__init__()
         self.ib_app = ib_app
+        self.contract_resolver = contract_resolver
         self.next_order_id = None
         self.active_orders = {}  # order_id -> order info
-        
+
     def set_ib_app(self, ib_app):
         """Set the IB app instance"""
         self.ib_app = ib_app
+
+    def set_contract_resolver(self, resolver):
+        """Set the contract resolver used to qualify SMART contracts."""
+        self.contract_resolver = resolver
         
     def set_next_order_id(self, order_id: int):
         """Set the next valid order ID from IB"""
@@ -32,115 +35,139 @@ class OrderManager(QObject):
         logger.info(f"Next valid order ID: {order_id}")
         
     def get_next_order_id(self) -> int:
-        """Get and increment the next order ID"""
+        """Get and increment the next order ID.
+
+        Raises ``ConnectionError`` if IB has not yet provided a starting ID
+        (i.e. ``nextValidId`` hasn't fired). Callers should guard against
+        the not-connected case before invoking; this raise is a hard fence
+        for accidental use.
+        """
         if self.next_order_id is None:
-            logger.error("Next order ID not set")
-            return None
-            
+            raise ConnectionError("Order ID not initialized — not connected to IB")
+
         current_id = self.next_order_id
         self.next_order_id += 1
         return current_id
         
-    def create_bracket_order(self, ticker: str, action: str, entry_price: float, 
+    def create_bracket_order(self, ticker: str, action: str, entry_price: float,
                        stop_loss: float, take_profit: float, quantity: int,
-                       entry_order_type: str = "LMT"):
-        """Create and submit a bracket order with specified quantity and entry order type"""
+                       entry_order_type: str = "LMT", trailing_percent: float = 0.0):
+        """Create and submit a bracket order with specified quantity and entry order type.
+
+        Contract resolution is async (so delayed-data subscriptions get a
+        primaryExchange) — synchronous validation runs first, then the
+        actual order placement happens in the resolve callback.
+
+        ``trailing_percent`` > 0 swaps the protective stop leg for a TRAIL
+        order; ``stop_loss`` becomes the initial trigger (``trailStopPrice``).
+        """
         if not self.ib_app or not self.ib_app.isConnected():
             error_msg = "Cannot create order: Not connected to IB"
             logger.error(error_msg)
             self.order_error.emit(error_msg)
             return
-            
+
         if self.next_order_id is None:
             error_msg = "Cannot create order: Order ID not initialized"
             logger.error(error_msg)
             self.order_error.emit(error_msg)
             return
-            
+
         if quantity <= 0:
             error_msg = f"Invalid quantity: {quantity}"
             logger.error(error_msg)
             self.order_error.emit(error_msg)
             return
-            
+
+        if not self.contract_resolver:
+            error_msg = "Cannot create order: contract resolver not configured"
+            logger.error(error_msg)
+            self.order_error.emit(error_msg)
+            return
+
+        self.contract_resolver.resolve(
+            ticker,
+            lambda c, e, t=ticker, a=action, ep=entry_price, sl=stop_loss,
+                   tp=take_profit, q=quantity, ot=entry_order_type, tr=trailing_percent:
+                self._on_contract_resolved_bracket(t, a, ep, sl, tp, q, ot, tr, c, e),
+        )
+
+    def _on_contract_resolved_bracket(self, ticker, action, entry_price,
+                                       stop_loss, take_profit, quantity,
+                                       entry_order_type, trailing_percent,
+                                       contract, error):
+        if not contract:
+            error_msg = f"Contract resolution failed for {ticker}: {error}"
+            logger.error(error_msg)
+            self.order_error.emit(error_msg)
+            return
+        if not self.ib_app or not self.ib_app.isConnected():
+            self.order_error.emit("Not connected to IB")
+            return
+
         try:
-            # Create contract
-            contract = self._create_stock_contract(ticker)
-            
-            # Get order IDs for bracket order
             parent_order_id = self.get_next_order_id()
             stop_order_id = self.get_next_order_id()
             profit_order_id = self.get_next_order_id()
-            
-            # Create parent order (entry) - can be LIMIT or STOP
+
             if entry_order_type == "STP":
                 parent_order = self._create_stop_order(action, quantity, entry_price)
                 order_type_text = "STOP"
             else:
                 parent_order = self._create_limit_order(action, quantity, entry_price)
                 order_type_text = "LIMIT"
-                
+
             parent_order.orderId = parent_order_id
-            parent_order.transmit = False  # Don't transmit until bracket is complete
-            
-            # Create stop loss order
+            parent_order.transmit = False
+
             stop_action = "SELL" if action == "BUY" else "BUY"
-            stop_order = self._create_stop_order(stop_action, quantity, stop_loss)
+            if trailing_percent > 0:
+                stop_order = self._create_trailing_stop_order(
+                    stop_action, quantity, trailing_percent, stop_loss
+                )
+                stop_desc = f"trailing {trailing_percent}% (initial trigger {stop_loss})"
+            else:
+                stop_order = self._create_stop_order(stop_action, quantity, stop_loss)
+                stop_desc = f"stop @ {stop_loss}"
             stop_order.orderId = stop_order_id
             stop_order.parentId = parent_order_id
+            stop_order.tif = "GTC"  # Survive across sessions for swing trades.
             stop_order.transmit = False
-            
-            # Create take profit order
+
             profit_order = self._create_limit_order(stop_action, quantity, take_profit)
             profit_order.orderId = profit_order_id
             profit_order.parentId = parent_order_id
-            profit_order.transmit = True  # Transmit all orders now
-            
-            # Store order info
+            profit_order.tif = "GTC"
+            profit_order.transmit = True
+
             self.active_orders[parent_order_id] = {
-                'ticker': ticker,
-                'action': action,
-                'quantity': quantity,
-                'entry': entry_price,
-                'stop': stop_loss,
-                'profit': take_profit,
-                'type': 'bracket_parent',
-                'entry_order_type': entry_order_type
+                'ticker': ticker, 'action': action, 'quantity': quantity,
+                'entry': entry_price, 'stop': stop_loss, 'profit': take_profit,
+                'type': 'bracket_parent', 'entry_order_type': entry_order_type,
+                'trailing_percent': trailing_percent,
             }
             self.active_orders[stop_order_id] = {
-                'ticker': ticker,
-                'type': 'bracket_stop',
-                'parent': parent_order_id
+                'ticker': ticker, 'type': 'bracket_stop', 'parent': parent_order_id,
+                'trailing_percent': trailing_percent,
             }
             self.active_orders[profit_order_id] = {
-                'ticker': ticker,
-                'type': 'bracket_profit',
-                'parent': parent_order_id
+                'ticker': ticker, 'type': 'bracket_profit', 'parent': parent_order_id,
             }
-            
-            # Submit orders
-            logger.info(f"Submitting bracket order for {ticker}: {action} {quantity} @ {entry_price} ({order_type_text}), stop @ {stop_loss}, target @ {take_profit}")
-            
+
+            logger.info(f"Submitting bracket order for {ticker}: {action} {quantity} @ {entry_price} ({order_type_text}), {stop_desc}, target @ {take_profit}")
+
             self.ib_app.placeOrder(parent_order_id, contract, parent_order)
             self.ib_app.placeOrder(stop_order_id, contract, stop_order)
             self.ib_app.placeOrder(profit_order_id, contract, profit_order)
-            
+
             logger.info(f"Bracket order submitted with IDs: parent={parent_order_id} ({order_type_text}), stop={stop_order_id}, profit={profit_order_id}")
-            
+
         except Exception as e:
             error_msg = f"Error creating bracket order: {str(e)}"
             logger.error(error_msg, exc_info=True)
             self.order_error.emit(error_msg)
-            
-    def _create_stock_contract(self, symbol: str) -> Contract:
-        """Create a stock contract for the given symbol"""
-        contract = Contract()
-        contract.symbol = symbol
-        contract.secType = "STK"
-        contract.exchange = "SMART"
-        contract.currency = "USD"
-        return contract
-        
+
+
     def _create_limit_order(self, action: str, quantity: int, limit_price: float) -> Order:
         """Create a limit order"""
         order = Order()
@@ -159,6 +186,25 @@ class OrderManager(QObject):
         order.orderType = "STP"
         order.totalQuantity = quantity
         order.auxPrice = stop_price  # Stop price for stop orders
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+        return order
+
+    def _create_trailing_stop_order(self, action: str, quantity: int,
+                                     trailing_percent: float, stop_price: float) -> Order:
+        """Create a percentage trailing stop order.
+
+        ``trailing_percent`` is the % distance the stop trails the high water
+        mark (e.g. 2.0 = 2%). ``stop_price`` becomes ``trailStopPrice`` — the
+        initial trigger that protects until the trail has a favorable move
+        to track from.
+        """
+        order = Order()
+        order.action = action
+        order.orderType = "TRAIL"
+        order.totalQuantity = quantity
+        order.trailingPercent = trailing_percent
+        order.trailStopPrice = stop_price
         order.eTradeOnly = False
         order.firmQuoteOnly = False
         return order
@@ -192,6 +238,6 @@ class OrderManager(QObject):
         except Exception as e:
             logger.error(f"Error cancelling order {order_id}: {e}")
             
-    def get_active_orders(self) -> Dict:
+    def get_active_orders(self) -> dict:
         """Get all active orders"""
         return self.active_orders.copy()

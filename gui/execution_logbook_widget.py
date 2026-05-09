@@ -314,5 +314,9 @@ class ExecutionLogBookWidget(QWidget):
     def closeEvent(self, event):
         """Clean up when widget is closed"""
         if hasattr(self, 'auto_refresh_timer'):
+            try:
+                self.auto_refresh_timer.timeout.disconnect()
+            except TypeError:
+                pass
             self.auto_refresh_timer.stop()
         event.accept()

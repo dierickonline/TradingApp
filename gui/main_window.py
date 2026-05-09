@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont
 from core.ib_app import IBApp, IBSignals
+from core.contract_resolver import ContractResolver
 from core.market_data_manager import MarketDataManager
 from core.historical_data_manager import HistoricalDataManager
 from core.order_manager import OrderManager
@@ -30,10 +31,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.ib_app = None
         self.qt_log_handler = qt_log_handler
-        self.market_data_manager = MarketDataManager()
-        self.historical_data_manager = HistoricalDataManager()
-        self.order_manager = OrderManager()
+        self.contract_resolver = ContractResolver()
+        self.market_data_manager = MarketDataManager(contract_resolver=self.contract_resolver)
+        self.historical_data_manager = HistoricalDataManager(contract_resolver=self.contract_resolver)
+        self.order_manager = OrderManager(contract_resolver=self.contract_resolver)
         self.position_manager = PositionManager()
+        # Distinguishes user-initiated disconnects from unplanned drops so we
+        # can warn the user only in the latter case.
+        self._user_initiated_disconnect = False
         self.init_ui()
         logger.info("MainWindow initialized")
         
@@ -201,10 +206,14 @@ class MainWindow(QMainWindow):
         
         return tab_widget
         
-    def connect_to_ib(self, host, port, client_id):
+    def connect_to_ib(self, host, port, client_id, market_data_type=None):
         """Connect to Interactive Brokers"""
         try:
-            logger.info("Attempting to connect to IB")
+            if market_data_type is None:
+                market_data_type = APP_CONFIG.default_market_data_type
+            logger.info(
+                f"Attempting to connect to IB (market data type={market_data_type})"
+            )
             
             # Create signals for thread-safe communication
             self.signals = IBSignals()
@@ -212,6 +221,11 @@ class MainWindow(QMainWindow):
             self.signals.account_value.connect(self.update_account_value)
             self.signals.error_message.connect(self.handle_error)
             
+            # Connect contract resolver signals (used to qualify SMART
+            # contracts with primaryExchange — required for delayed data).
+            self.signals.contract_details.connect(self.contract_resolver.handle_contract_details)
+            self.signals.contract_details_end.connect(self.contract_resolver.handle_contract_details_end)
+
             # Connect market data signals
             self.signals.tick_price.connect(self.market_data_manager.handle_tick_price)
             self.signals.tick_size.connect(self.market_data_manager.handle_tick_size)
@@ -236,8 +250,12 @@ class MainWindow(QMainWindow):
             
             # Create IB app instance
             self.ib_app = IBApp(self.signals)
-            
+            # Apply selected market data type before connect() — IBApp.connectAck
+            # reads this and calls reqMarketDataType once the socket is up.
+            self.ib_app.market_data_type = market_data_type
+
             # Set IB app in managers
+            self.contract_resolver.set_ib_app(self.ib_app)
             self.market_data_manager.set_ib_app(self.ib_app)
             self.historical_data_manager.set_ib_app(self.ib_app)
             self.order_manager.set_ib_app(self.ib_app)
@@ -278,12 +296,37 @@ class MainWindow(QMainWindow):
         self.ib_app.run()
         
     def disconnect_from_ib(self):
-        """Disconnect from Interactive Brokers"""
+        """Disconnect from Interactive Brokers.
+
+        If there are open positions, prompt the user first — disconnecting
+        only stops local tracking; the positions continue to exist at IB and
+        any active stop-loss / take-profit orders remain in force.
+        """
+        open_positions = self.position_manager.get_positions_list()
+        if open_positions:
+            symbols = ", ".join(sorted({p.symbol for p in open_positions}))
+            reply = QMessageBox.warning(
+                self,
+                "Disconnect with open positions?",
+                f"You have {len(open_positions)} open position(s) ({symbols}).\n\n"
+                "Disconnecting only stops local tracking — positions and any "
+                "stop-loss/take-profit orders remain active at IB.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                logger.info("Disconnect cancelled by user (open positions)")
+                return
+
         logger.info("Disconnecting from IB")
-        
+        self._user_initiated_disconnect = True
+
         # Clear all market data subscriptions
         self.market_data_manager.clear_all_subscriptions()
-        
+        self.contract_resolver.cancel_pending()
+        self.position_manager.reset_order_ids()
+
         if self.ib_app:
             self.update_timer.stop()
             self.ib_app.disconnect()
@@ -297,9 +340,35 @@ class MainWindow(QMainWindow):
             self.ib_app.reqAccountSummary(1, "All", "AvailableFunds")
             
     def update_connection_status(self, connected):
-        """Update connection status in UI"""
+        """Update connection status in UI and clean up on unplanned drops.
+
+        ``self.ib_app`` is set to ``None`` by ``disconnect_from_ib`` before it
+        triggers the underlying IB ``disconnect()``, so when this slot fires
+        for a user-initiated disconnect, ``self.ib_app`` is already ``None``.
+        Anything else with ``connected=False`` is an unplanned drop (network,
+        gateway shutdown, etc.) — clean up state and warn the user.
+        """
         self.connection_widget.update_connection_status(connected)
         self.trader_widget.set_connection_status(connected)
+
+        if connected:
+            self._user_initiated_disconnect = False
+            return
+
+        if self._user_initiated_disconnect:
+            self._user_initiated_disconnect = False
+            return
+
+        if self.ib_app is not None:
+            logger.warning("Unplanned disconnect from IB; clearing local state")
+            self.market_data_manager.clear_all_subscriptions()
+            self.contract_resolver.cancel_pending()
+            self.position_manager.reset_order_ids()
+            self.update_timer.stop()
+            self.ib_app = None
+            self.connection_widget.show_error(
+                "Connection to IB was lost. Click Connect to reconnect."
+            )
             
     def update_account_value(self, account, tag, value, currency):
         """Update account value in UI"""
@@ -314,25 +383,54 @@ class MainWindow(QMainWindow):
                 logger.error(f"Error parsing available funds: {value}")
                 
     def handle_error(self, reqId, errorCode, errorString):
-        """Handle error messages from IB"""
-        # Filter out common non-critical errors and warnings
-        if errorCode in [2104, 2106, 2158, 2174, 2176]:  # Market data farm messages, timezone and fractional share warnings
+        """Route an IB error to the right manager based on request category.
+
+        Categories are assigned by ``IBApp.allocate_request_id`` when the
+        original request was made; we look them up here rather than relying
+        on hardcoded numeric ranges, which used to cap market data at 999
+        concurrent subscriptions before colliding with historical data.
+        """
+        # Filter out common non-critical errors and warnings.
+        # 10167/10168 = "Displaying delayed market data" — informational
+        #   confirmation that IB accepted the subscription at delayed tier.
+        # 300 = "Can't find EId" — stale cancel, see IBApp.error.
+        if errorCode in [2104, 2106, 2158, 2174, 2176, 10167, 10168, 300]:
             logger.debug(f"IB Info/Warning {errorCode}: {errorString}")
             return
-            
-        # Pass error to market data manager if it's a market data request
-        if reqId >= 1000 and reqId < 2000:  # Our market data requests are 1000-1999
+
+        # 10089/10090/10091 = "subscription required for this market data".
+        # When IB has no fallback (no free delayed entitlement for this feed)
+        # no ticks will follow, so we must surface this to the user instead
+        # of leaving the trader stuck on "Subscribing to ...". Route to the
+        # market data manager so it emits subscription_error → trader widget.
+        # IBApp.error already logs these at INFO level upstream.
+
+        category = self.ib_app.request_category(reqId) if self.ib_app else None
+
+        if category == "market":
             self.market_data_manager.handle_error(reqId, errorCode, errorString)
-        elif reqId >= 2000:  # Historical data requests start at 2000
+        elif category == "historical":
             self.historical_data_manager.handle_error(reqId, errorCode, errorString)
+        elif category == "contract":
+            self.contract_resolver.handle_error(reqId, errorCode, errorString)
+        elif category == "execution":
+            # IBExecutionFetcher consumes errors via its own signal handler.
+            logger.debug(
+                f"IB Error for execution request {reqId}: {errorCode} {errorString}"
+            )
         else:
+            # Unknown reqId or single-shot request (e.g. account summary).
             self.connection_widget.show_error(f"Error {errorCode}: {errorString}")
             
-    def execute_bracket_order(self, ticker, action, entry_price, stop_loss, take_profit, quantity, entry_order_type="LMT"):
+    def execute_bracket_order(self, ticker, action, entry_price, stop_loss, take_profit, quantity, entry_order_type="LMT", trailing_percent=0.0):
         """Execute a bracket order"""
         order_type_text = "LIMIT" if entry_order_type == "LMT" else "STOP"
-        logger.info(f"Executing bracket order: {ticker} {action} {quantity} shares @ {entry_price} ({order_type_text}), stop: {stop_loss}, target: {take_profit}")
-        self.order_manager.create_bracket_order(ticker, action, entry_price, stop_loss, take_profit, quantity, entry_order_type)
+        if trailing_percent > 0:
+            stop_text = f"trailing {trailing_percent}% (initial trigger {stop_loss})"
+        else:
+            stop_text = f"stop: {stop_loss}"
+        logger.info(f"Executing bracket order: {ticker} {action} {quantity} shares @ {entry_price} ({order_type_text}), {stop_text}, target: {take_profit}")
+        self.order_manager.create_bracket_order(ticker, action, entry_price, stop_loss, take_profit, quantity, entry_order_type, trailing_percent)
         
     def show_order_error(self, error_msg):
         """Show order error in a message box"""

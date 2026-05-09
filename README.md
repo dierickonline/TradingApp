@@ -111,7 +111,7 @@ cd IB-trading-app
 python -m venv .venv
 source .venv/bin/activate        # Linux/Mac
 # .venv\Scripts\activate         # Windows
-pip install PyQt6 ibapi pandas numpy python-dateutil
+pip install -r requirements.txt
 ```
 
 ### Run

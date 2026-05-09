@@ -1,9 +1,9 @@
 # gui/trader_widget_refactored.py
 """Refactored trader widget with separated concerns"""
 import logging
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QPushButton, QLineEdit, QGroupBox, QMessageBox,
-                            QSpacerItem, QSizePolicy, QRadioButton)
+                            QSpacerItem, QSizePolicy, QRadioButton, QCheckBox)
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt
 
 from core.trader_logic import TradingCalculator, TraderModel
@@ -246,7 +246,69 @@ class TradingControlsSection(QGroupBox):
         price_layout.addWidget(self.stop_input)
         price_layout.addWidget(self.profit_input)
         layout.addLayout(price_layout)
-        
+
+        # Trailing stop option — when enabled, the Stop Loss field becomes
+        # the initial trigger and the stop trails by the given percentage.
+        trailing_layout = QHBoxLayout()
+        trailing_layout.setSpacing(10)
+
+        self.trailing_checkbox = QCheckBox("Trailing Stop")
+        self.trailing_checkbox.setStyleSheet("""
+            QCheckBox {
+                font-size: 12px;
+                font-weight: bold;
+                color: #333;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: white;
+                border: 2px solid #ccc;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #f44336;
+                border: 2px solid #da190b;
+                border-radius: 3px;
+            }
+        """)
+        self.trailing_checkbox.toggled.connect(self.on_trailing_toggled)
+
+        self.trailing_percent_label = QLabel("Trail %:")
+        self.trailing_percent_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.trailing_percent_label.setEnabled(False)
+
+        self.trailing_percent_input = QLineEdit()
+        self.trailing_percent_input.setPlaceholderText("2.0")
+        self.trailing_percent_input.setMaximumWidth(80)
+        self.trailing_percent_input.setEnabled(False)
+        self.trailing_percent_input.setStyleSheet("""
+            QLineEdit {
+                padding: 6px;
+                border: 2px solid #ddd;
+                border-radius: 4px;
+                font-size: 13px;
+                background-color: white;
+            }
+            QLineEdit:focus {
+                border-color: #f44336;
+            }
+            QLineEdit:disabled {
+                background-color: #f0f0f0;
+                color: #999;
+            }
+        """)
+
+        trailing_layout.addWidget(self.trailing_checkbox)
+        trailing_layout.addSpacing(20)
+        trailing_layout.addWidget(self.trailing_percent_label)
+        trailing_layout.addWidget(self.trailing_percent_input)
+        trailing_layout.addStretch()
+        layout.addLayout(trailing_layout)
+
         # Position size display
         self.position_display = PositionSizeDisplay()
         layout.addWidget(self.position_display)
@@ -378,7 +440,33 @@ class TradingControlsSection(QGroupBox):
     def get_entry_order_type(self) -> str:
         """Get selected entry order type"""
         return "LMT" if self.limit_radio.isChecked() else "STP"
-        
+
+    def on_trailing_toggled(self, checked: bool):
+        """Enable/disable the trail percent input alongside the checkbox."""
+        self.trailing_percent_label.setEnabled(checked)
+        self.trailing_percent_input.setEnabled(checked)
+        if checked and not self.trailing_percent_input.text():
+            self.trailing_percent_input.setFocus()
+
+    def get_trailing_percent(self) -> float:
+        """Return the configured trailing percent, or 0.0 if disabled.
+
+        Raises ValueError on a checked-but-invalid input so the caller can
+        surface a single warning instead of silently submitting a fixed stop.
+        """
+        if not self.trailing_checkbox.isChecked():
+            return 0.0
+        text = self.trailing_percent_input.text().strip()
+        if not text:
+            raise ValueError("Enter a trail percent (e.g. 2.0) or uncheck Trailing Stop.")
+        try:
+            value = float(text)
+        except ValueError:
+            raise ValueError(f"Invalid trail percent: {text!r}")
+        if value <= 0 or value >= 100:
+            raise ValueError(f"Trail percent must be between 0 and 100 (got {value}).")
+        return value
+
     def on_execute_order(self):
         """Handle execute order button"""
         try:
@@ -388,21 +476,27 @@ class TradingControlsSection(QGroupBox):
             profit = self.profit_input.get_value()
             is_buy = self.order_type_selector.is_buy_selected()
             entry_order_type = self.get_entry_order_type()
-            
+
+            try:
+                trailing_percent = self.get_trailing_percent()
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Trailing Stop", str(e))
+                return
+
             # Validate
             valid, error = self.calculator.validate_order_prices(entry, stop, profit, is_buy)
             if not valid:
                 QMessageBox.warning(self, "Invalid Order", error)
                 return
-                
+
             if not self.model.current_ticker:
                 QMessageBox.warning(self, "No Ticker", "Please subscribe to a ticker first.")
                 return
-                
+
             if self.model.calculated_position_size <= 0:
                 QMessageBox.warning(self, "Invalid Position", "Position size is zero.")
                 return
-                
+
             # Create order data
             order_data = self.model.create_order_data(
                 "BUY" if is_buy else "SELL",
@@ -411,6 +505,7 @@ class TradingControlsSection(QGroupBox):
             )
             # Add entry order type
             order_data['entry_order_type'] = entry_order_type
+            order_data['trailing_percent'] = trailing_percent
             
             # Show confirmation if enabled
             if self.model.show_trade_confirmation:
@@ -430,11 +525,17 @@ class TradingControlsSection(QGroupBox):
     def confirm_order(self, order_data: dict) -> bool:
         """Show order confirmation dialog"""
         order_type_text = "LIMIT" if order_data['entry_order_type'] == "LMT" else "STOP"
+        trailing_percent = order_data.get('trailing_percent', 0.0)
+        if trailing_percent > 0:
+            stop_line = (f"Stop Loss: ${order_data['stop_loss']:.2f} "
+                         f"(trailing {trailing_percent}%)\n")
+        else:
+            stop_line = f"Stop Loss: ${order_data['stop_loss']:.2f}\n"
         msg = f"Confirm {order_data['action']} Order:\n\n"
         msg += f"Ticker: {order_data['ticker']}\n"
         msg += f"Entry Type: {order_type_text}\n"
         msg += f"Entry Price: ${order_data['entry_price']:.2f}\n"
-        msg += f"Stop Loss: ${order_data['stop_loss']:.2f}\n"
+        msg += stop_line
         msg += f"Take Profit: ${order_data['take_profit']:.2f}\n"
         msg += f"Quantity: {order_data['quantity']} shares\n\n"
         msg += "Execute this bracket order?"
@@ -450,6 +551,8 @@ class TradingControlsSection(QGroupBox):
         self.entry_input.clear()
         self.stop_input.clear()
         self.profit_input.clear()
+        self.trailing_checkbox.setChecked(False)
+        self.trailing_percent_input.clear()
         self.position_display.clear_display()
         
     def use_market_price(self):
@@ -498,7 +601,7 @@ class TraderWidget(QWidget):
     subscribe_ticker = pyqtSignal(str, bool)  # ticker, is_position
     unsubscribe_ticker = pyqtSignal(str)
     request_atr = pyqtSignal(str)
-    execute_bracket_order = pyqtSignal(str, str, float, float, float, int, str)  # Added entry_order_type
+    execute_bracket_order = pyqtSignal(str, str, float, float, float, int, str, float)  # Added entry_order_type, trailing_percent
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -615,7 +718,8 @@ class TraderWidget(QWidget):
             order_data['stop_loss'],
             order_data['take_profit'],
             order_data['quantity'],
-            order_data.get('entry_order_type', 'LMT')  # Default to LIMIT if not specified
+            order_data.get('entry_order_type', 'LMT'),  # Default to LIMIT if not specified
+            order_data.get('trailing_percent', 0.0),    # 0 means fixed stop
         )
         
     def update_market_data(self, ticker: str, bid: float, ask: float, 
@@ -652,11 +756,15 @@ class TraderWidget(QWidget):
             self.market_data_display.update_data({"atr": f"${atr_value:.2f}"})
             
     def show_error(self, ticker: str, error_msg: str):
-        """Show error message for a specific ticker"""
-        # Only show error if it's for the current ticker
+        """Show error message for a specific ticker.
+
+        Order matters: ``on_unsubscribe`` calls ``set_subscribed(False)`` which
+        wipes the status label, so the error message must be set *after* the
+        unsubscribe — otherwise it flickers in and disappears.
+        """
         if hasattr(self, '_current_ticker') and ticker == self._current_ticker:
-            self.ticker_section.set_status(f"Error: {error_msg}", is_error=True)
             self.on_unsubscribe()
+            self.ticker_section.set_status(f"Error: {error_msg}", is_error=True)
         
     def set_connection_status(self, connected: bool):
         """Update based on connection status"""

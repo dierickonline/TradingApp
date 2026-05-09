@@ -1,23 +1,47 @@
 # gui/positions_widget.py
 """Widget for displaying and managing open positions"""
 import logging
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QPushButton, QTableWidget, QTableWidgetItem,
                             QHeaderView, QGroupBox, QMessageBox)
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, Qt, QTimer
 from PyQt6.QtGui import QColor, QBrush
 
+from gui.styles import (
+    primary_button_qss,
+    RGB_PNL_POSITIVE,
+    RGB_PNL_NEGATIVE,
+)
+
 logger = logging.getLogger(__name__)
+
+
+_BRUSH_PNL_POSITIVE = QBrush(QColor(*RGB_PNL_POSITIVE))
+_BRUSH_PNL_NEGATIVE = QBrush(QColor(*RGB_PNL_NEGATIVE))
 
 
 class PositionsWidget(QGroupBox):
     """Widget for displaying open positions"""
-    
+
+    # Column indices into the positions table. Use these constants when
+    # reading or writing table cells; the magic numbers used to be sprinkled
+    # across the file and were a frequent source of off-by-one bugs.
+    COL_SYMBOL = 0
+    COL_QTY = 1
+    COL_AVG_COST = 2
+    COL_CURRENT = 3
+    COL_POSITION_VALUE = 4
+    COL_UNREALIZED_PNL = 5
+    COL_TOTAL_PNL = 6
+    COL_CLOSE_50 = 7
+    COL_CLOSE_100 = 8
+    CLOSE_BUTTON_COLS = (COL_CLOSE_50, COL_CLOSE_100)
+
     # Signals
     close_position = pyqtSignal(str, float)  # symbol, percentage
     refresh_positions = pyqtSignal()
     subscribe_position_ticker = pyqtSignal(str)  # symbol - to get real-time prices
-    
+
     def __init__(self, parent=None):
         super().__init__("Open Positions", parent)
         self.positions = {}  # symbol -> position data
@@ -48,20 +72,7 @@ class PositionsWidget(QGroupBox):
         # Refresh button
         refresh_layout = QHBoxLayout()
         self.refresh_btn = QPushButton("Refresh Positions")
-        self.refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 5px 15px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-        """)
+        self.refresh_btn.setStyleSheet(primary_button_qss())
         self.refresh_btn.clicked.connect(self.on_refresh_clicked)
         refresh_layout.addWidget(self.refresh_btn)
         refresh_layout.addStretch()
@@ -78,19 +89,12 @@ class PositionsWidget(QGroupBox):
         
         # Set column widths
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Symbol
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Qty
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Avg Cost
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Current
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Position Value
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # Unrealized P&L
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)  # Total P&L
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)  # Close 50%
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)  # Close 100%
-        
-        # Set fixed width for button columns
-        header.resizeSection(7, 100)  # Close 50% button width
-        header.resizeSection(8, 100)  # Close 100% button width
+        for col in (self.COL_SYMBOL, self.COL_QTY, self.COL_AVG_COST, self.COL_CURRENT,
+                    self.COL_POSITION_VALUE, self.COL_UNREALIZED_PNL, self.COL_TOTAL_PNL):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        for col in self.CLOSE_BUTTON_COLS:
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            header.resizeSection(col, 100)
         
         # Style the table
         self.table.setStyleSheet("""
@@ -158,43 +162,41 @@ class PositionsWidget(QGroupBox):
                 self.subscribe_position_ticker.emit(symbol)
                 
             # Safely update row data
-            self._set_table_item(row, 0, symbol)
-            self._set_table_item(row, 1, str(int(position_data.quantity)))
-            self._set_table_item(row, 2, f"${position_data.avg_cost:.2f}")
-            self._set_table_item(row, 3, f"${position_data.current_price:.2f}")
-            
+            self._set_table_item(row, self.COL_SYMBOL, symbol)
+            self._set_table_item(row, self.COL_QTY, str(int(position_data.quantity)))
+            self._set_table_item(row, self.COL_AVG_COST, f"${position_data.avg_cost:.2f}")
+            self._set_table_item(row, self.COL_CURRENT, f"${position_data.current_price:.2f}")
+
             # Position Value
             position_value = abs(position_data.quantity) * position_data.current_price
-            self._set_table_item(row, 4, f"${position_value:,.2f}")
-            
+            self._set_table_item(row, self.COL_POSITION_VALUE, f"${position_value:,.2f}")
+
             # Unrealized P&L with color
             unrealized_pnl = position_data.unrealized_pnl
             unrealized_item = QTableWidgetItem(f"${unrealized_pnl:,.2f}")
-            if unrealized_pnl >= 0:
-                unrealized_item.setForeground(QBrush(QColor(76, 175, 80)))  # Green
-            else:
-                unrealized_item.setForeground(QBrush(QColor(244, 67, 54)))  # Red
-            self.table.setItem(row, 5, unrealized_item)
-            
+            unrealized_item.setForeground(
+                _BRUSH_PNL_POSITIVE if unrealized_pnl >= 0 else _BRUSH_PNL_NEGATIVE
+            )
+            self.table.setItem(row, self.COL_UNREALIZED_PNL, unrealized_item)
+
             # Total P&L with color
             total_pnl = position_data.total_pnl
             total_item = QTableWidgetItem(f"${total_pnl:,.2f}")
-            if total_pnl >= 0:
-                total_item.setForeground(QBrush(QColor(76, 175, 80)))  # Green
-            else:
-                total_item.setForeground(QBrush(QColor(244, 67, 54)))  # Red
-            self.table.setItem(row, 6, total_item)
-            
+            total_item.setForeground(
+                _BRUSH_PNL_POSITIVE if total_pnl >= 0 else _BRUSH_PNL_NEGATIVE
+            )
+            self.table.setItem(row, self.COL_TOTAL_PNL, total_item)
+
             # Close buttons - only create if they don't exist
-            if not self.table.cellWidget(row, 7):
-                close_50_btn = self._create_close_button("Close 50%", "#FF9800", "#F57C00", 
+            if not self.table.cellWidget(row, self.COL_CLOSE_50):
+                close_50_btn = self._create_close_button("Close 50%", "#FF9800", "#F57C00",
                                                         lambda: self.on_close_position(symbol, 50))
-                self.table.setCellWidget(row, 7, close_50_btn)
-            
-            if not self.table.cellWidget(row, 8):
+                self.table.setCellWidget(row, self.COL_CLOSE_50, close_50_btn)
+
+            if not self.table.cellWidget(row, self.COL_CLOSE_100):
                 close_100_btn = self._create_close_button("Close 100%", "#f44336", "#da190b",
                                                          lambda: self.on_close_position(symbol, 100))
-                self.table.setCellWidget(row, 8, close_100_btn)
+                self.table.setCellWidget(row, self.COL_CLOSE_100, close_100_btn)
             
             # Store position data
             self.positions[symbol] = position_data
@@ -246,12 +248,13 @@ class PositionsWidget(QGroupBox):
             row = self.find_position_row(symbol)
             if row != -1:
                 # Disconnect any signals from buttons before removing
-                for col in [7, 8]:  # Close button columns
+                for col in self.CLOSE_BUTTON_COLS:
                     widget = self.table.cellWidget(row, col)
                     if widget:
                         try:
                             widget.clicked.disconnect()
-                        except:
+                        except TypeError:
+                            # PyQt raises TypeError when no slots are connected
                             pass
                 
                 # Remove the row
@@ -272,7 +275,7 @@ class PositionsWidget(QGroupBox):
         """Find the row index for a symbol"""
         try:
             for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
+                item = self.table.item(row, self.COL_SYMBOL)
                 if item and item.text() == symbol:
                     return row
             return -1
@@ -353,12 +356,13 @@ class PositionsWidget(QGroupBox):
         try:
             # Disconnect all button signals first
             for row in range(self.table.rowCount()):
-                for col in [7, 8]:  # Close button columns
+                for col in self.CLOSE_BUTTON_COLS:
                     widget = self.table.cellWidget(row, col)
                     if widget:
                         try:
                             widget.clicked.disconnect()
-                        except:
+                        except TypeError:
+                            # PyQt raises TypeError when no slots are connected
                             pass
             
             self.table.setRowCount(0)

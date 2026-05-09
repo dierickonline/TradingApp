@@ -3,12 +3,14 @@
 import logging
 import sqlite3
 import os
-import time
+import threading
 from datetime import datetime, date
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 from ibapi.execution import ExecutionFilter
+
+from core.ib_app import REQ_CATEGORY_EXECUTION
 
 logger = logging.getLogger(__name__)
 
@@ -230,8 +232,8 @@ class ExecutionProcessor:
             try:
                 exec_datetime = datetime.strptime(exec['time'], "%Y%m%d %H:%M:%S")
                 exec_date = exec_datetime.date()
-            except:
-                logger.warning(f"Could not parse date: {exec['time']}")
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(f"Could not parse date {exec.get('time')!r}: {e}")
                 continue
                 
             # Get commission
@@ -304,12 +306,13 @@ class ExecutionProcessor:
             try:
                 exec_datetime = datetime.strptime(exec['time'], "%Y%m%d %H:%M:%S")
                 exec_date = exec_datetime.date()
-                
+
                 if start_date <= exec_date <= end_date:
                     filtered_executions[exec_id] = exec
                     if exec_id in commissions:
                         filtered_commissions[exec_id] = commissions[exec_id]
-            except:
+            except (ValueError, TypeError, KeyError) as e:
+                logger.debug(f"Skipping unparseable execution {exec_id}: {e}")
                 continue
                 
         return filtered_executions, filtered_commissions
@@ -350,73 +353,109 @@ class ExecutionProcessor:
 
 
 class IBExecutionFetcher(QThread):
-    """Separate thread to fetch IB execution data without blocking the UI"""
+    """Fetches IB execution + commission data without blocking the UI.
+
+    Subscribes to ``IBSignals.execution_details``, ``commission_report``, and
+    ``execution_details_end`` for the duration of one ``reqExecutions`` call,
+    then disconnects. This replaces the older approach of monkey-patching
+    ``self.ib_app.execDetails`` / ``commissionReport`` / ``execDetailsEnd``,
+    which silently broke other listeners (notably PositionManager's commission
+    tracking) for as long as the fetcher was running.
+
+    Signal slots are connected with ``Qt.DirectConnection`` so they execute on
+    the emitting thread (the IB message-pump thread); the fetcher's own
+    ``run()`` blocks on a ``threading.Event`` waiting for ``execDetailsEnd``.
+    """
+
     dataReady = pyqtSignal(dict, dict)  # executions, commissions
     statusUpdate = pyqtSignal(str)
     errorOccurred = pyqtSignal(str)
     progressUpdate = pyqtSignal(int, int)  # current, total
-    
+
+    TIMEOUT_SECONDS = 30
+
     def __init__(self, ib_app, start_date=None, end_date=None):
         super().__init__()
         self.ib_app = ib_app
         self.start_date = start_date
         self.end_date = end_date
-        self.executions = {}
-        self.commissions = {}
-        self.execution_request_complete = False
-        
+        self.executions: Dict[str, dict] = {}
+        # All commission reports we observe during our window, keyed by execId.
+        # Filtered down to just our executions after execDetailsEnd.
+        self._all_commissions: Dict[str, dict] = {}
+        self.commissions: Dict[str, dict] = {}
+        self._req_id: Optional[int] = None
+        self._done = threading.Event()
+
     def run(self):
-        """Run the execution fetch in a separate thread"""
+        """Run the execution fetch in this QThread."""
+        if not self.ib_app or not self.ib_app.isConnected():
+            self.errorOccurred.emit("Not connected to Interactive Brokers")
+            return
+
+        self.statusUpdate.emit("Fetching executions from IB...")
+        self._req_id = self.ib_app.allocate_request_id(REQ_CATEGORY_EXECUTION)
+
+        signals = self.ib_app.signals
+        # DirectConnection so slots run on the IB run-loop thread that emits
+        # them. Our slots only mutate dicts owned by this fetcher, which is
+        # safe given a single emitter thread.
+        signals.execution_details.connect(
+            self._on_execution_details, Qt.ConnectionType.DirectConnection
+        )
+        signals.commission_report.connect(
+            self._on_commission_report, Qt.ConnectionType.DirectConnection
+        )
+        signals.execution_details_end.connect(
+            self._on_execution_details_end, Qt.ConnectionType.DirectConnection
+        )
+
         try:
-            if not self.ib_app or not self.ib_app.isConnected():
-                self.errorOccurred.emit("Not connected to Interactive Brokers")
-                return
-                
-            self.statusUpdate.emit("Fetching executions from IB...")
-            
-            # Store original handlers
-            original_exec_handler = self.ib_app.execDetails
-            original_comm_handler = self.ib_app.commissionReport
-            original_end_handler = self.ib_app.execDetailsEnd
-            
-            # Set up our handlers
-            self.ib_app.execDetails = self.handle_exec_details
-            self.ib_app.commissionReport = self.handle_commission_report
-            self.ib_app.execDetailsEnd = self.handle_exec_details_end
-            
-            # Create execution filter
             exec_filter = ExecutionFilter()
             if self.start_date:
-                # IB expects format: "yyyymmdd-hh:mm:ss"
                 exec_filter.time = self.start_date.strftime("%Y%m%d-00:00:00")
-            
-            # Request executions
-            self.ib_app.reqExecutions(10001, exec_filter)
-            
-            # Wait for completion
-            timeout = 30  # 30 seconds timeout
-            start_time = time.time()
-            
-            while not self.execution_request_complete:
-                time.sleep(0.1)
-                if time.time() - start_time > timeout:
-                    self.errorOccurred.emit("Timeout waiting for executions")
-                    break
-                    
-            # Restore original handlers
-            self.ib_app.execDetails = original_exec_handler
-            self.ib_app.commissionReport = original_comm_handler
-            self.ib_app.execDetailsEnd = original_end_handler
-            
-            # Emit the data
+
+            self.ib_app.reqExecutions(self._req_id, exec_filter)
+
+            if not self._done.wait(timeout=self.TIMEOUT_SECONDS):
+                self.errorOccurred.emit("Timeout waiting for executions")
+                return
+
+            # Filter commissions to just the executions we received. Other
+            # commissions seen during our window belong to live trading and
+            # are owned by PositionManager via the same signal.
+            self.commissions = {
+                exec_id: data
+                for exec_id, data in self._all_commissions.items()
+                if exec_id in self.executions
+            }
             self.dataReady.emit(self.executions, self.commissions)
-            
+
         except Exception as e:
             logger.error(f"Error fetching executions: {e}", exc_info=True)
-            self.errorOccurred.emit(f"Error: {str(e)}")
-            
-    def handle_exec_details(self, reqId, contract, execution):
-        """Handle execution details"""
+            self.errorOccurred.emit(f"Error: {e}")
+
+        finally:
+            try:
+                signals.execution_details.disconnect(self._on_execution_details)
+            except TypeError:
+                pass
+            try:
+                signals.commission_report.disconnect(self._on_commission_report)
+            except TypeError:
+                pass
+            try:
+                signals.execution_details_end.disconnect(self._on_execution_details_end)
+            except TypeError:
+                pass
+            if self._req_id is not None:
+                self.ib_app.release_request_id(self._req_id)
+                self._req_id = None
+
+    def _on_execution_details(self, reqId, contract, execution):
+        """Slot for IBSignals.execution_details. Filtered by our reqId."""
+        if reqId != self._req_id:
+            return
         self.executions[execution.execId] = {
             'symbol': contract.symbol,
             'time': execution.time,
@@ -429,18 +468,20 @@ class IBExecutionFetcher(QThread):
             'exchange': execution.exchange,
             'contract': contract
         }
-        
-    def handle_commission_report(self, commissionReport):
-        """Handle commission reports"""
-        self.commissions[commissionReport.execId] = {
-            'commission': abs(commissionReport.commission),  # Always positive
+
+    def _on_commission_report(self, commissionReport):
+        """Slot for IBSignals.commission_report. Captures all; filtered later."""
+        self._all_commissions[commissionReport.execId] = {
+            'commission': abs(commissionReport.commission),
             'currency': commissionReport.currency,
-            'realizedPNL': commissionReport.realizedPNL
+            'realizedPNL': commissionReport.realizedPNL,
         }
-        
-    def handle_exec_details_end(self, reqId):
-        """Called when all executions have been delivered"""
-        self.execution_request_complete = True
+
+    def _on_execution_details_end(self, reqId):
+        """Slot for IBSignals.execution_details_end. Filtered by our reqId."""
+        if reqId != self._req_id:
+            return
+        self._done.set()
 
 
 class ExecutionDataModel(QObject):

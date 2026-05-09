@@ -4,82 +4,96 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from PyQt6.QtCore import QObject, pyqtSignal
-from ibapi.contract import Contract
 import pandas as pd
+
+from core.ib_app import REQ_CATEGORY_HISTORICAL
 
 logger = logging.getLogger(__name__)
 
 
 class HistoricalDataManager(QObject):
     """Manages historical data requests and technical indicator calculations"""
-    
+
     # Signals
     atr_calculated = pyqtSignal(str, float, int)  # ticker, atr_value, period
     historical_data_error = pyqtSignal(str, str)  # ticker, error message
     historical_data_received = pyqtSignal(str, object)  # ticker, dataframe
-    
-    def __init__(self, ib_app=None):
+
+    def __init__(self, ib_app=None, contract_resolver=None):
         super().__init__()
         self.ib_app = ib_app
+        self.contract_resolver = contract_resolver
         self.active_requests = {}  # req_id -> (ticker, request_type)
         self.historical_data = {}  # req_id -> list of bars
-        self.next_req_id = 2000  # Start with different range than market data
-        
+
     def set_ib_app(self, ib_app):
         """Set the IB app instance"""
         self.ib_app = ib_app
-        
+
+    def set_contract_resolver(self, resolver):
+        """Set the contract resolver used to qualify SMART contracts."""
+        self.contract_resolver = resolver
+
     def request_atr(self, ticker: str, period: int = 14, timeframe: str = "1 day"):
-        """Request historical data to calculate ATR"""
+        """Request historical data to calculate ATR.
+
+        Resolution is async — we first ask the resolver to qualify the
+        SMART contract (so delayed-data feeds get a primaryExchange), then
+        send ``reqHistoricalData`` from the resolve callback.
+        """
         if not self.ib_app or not self.ib_app.isConnected():
             logger.error("Cannot request ATR: Not connected to IB")
             self.historical_data_error.emit(ticker, "Not connected to IB")
             return
-            
+        if not self.contract_resolver:
+            logger.error("Cannot request ATR: contract resolver not configured")
+            self.historical_data_error.emit(ticker, "Contract resolver not configured")
+            return
+
+        self.contract_resolver.resolve(
+            ticker,
+            lambda c, e, t=ticker, p=period, tf=timeframe:
+                self._on_contract_resolved_atr(t, p, tf, c, e),
+        )
+
+    def _on_contract_resolved_atr(self, ticker, period, timeframe, contract, error):
+        if not contract:
+            logger.error(f"Contract resolution failed for {ticker}: {error}")
+            self.historical_data_error.emit(ticker, error or "Contract lookup failed")
+            return
+        if not self.ib_app or not self.ib_app.isConnected():
+            self.historical_data_error.emit(ticker, "Not connected to IB")
+            return
+
+        req_id = self.ib_app.allocate_request_id(REQ_CATEGORY_HISTORICAL)
         try:
-            # Create contract
-            contract = self._create_stock_contract(ticker)
-            
-            # Get next request ID
-            req_id = self.next_req_id
-            self.next_req_id += 1
-            
-            # Store request info
             self.active_requests[req_id] = (ticker, f"ATR_{period}")
             self.historical_data[req_id] = []
-            
-            # Use empty string for end date to get the most recent data
-            # IB will use current date/time if we pass empty string
-            end_date = ""
-            
-            # For ATR, we need at least period + 1 days of data
-            duration_days = max(period * 2, 30)  # Get extra data for accuracy
+
+            # Empty end_date means "now"; ATR needs at least period + 1
+            # days, take double for accuracy with a 30-day floor.
+            duration_days = max(period * 2, 30)
             duration = f"{duration_days} D"
-            
+
             logger.info(f"Requesting historical data for {ticker} ATR calculation")
-            
-            # Request historical data
             self.ib_app.reqHistoricalData(
                 req_id,
                 contract,
-                end_date,  # Empty string = current time
+                "",  # empty = current time
                 duration,
-                timeframe,  # "1 day" for daily ATR
+                timeframe,
                 "TRADES",
-                1,  # Use regular trading hours
-                1,  # Format date as yyyyMMdd HH:mm:ss
-                False,  # Keep up to date
-                []
+                1,  # regular trading hours
+                1,  # date as yyyyMMdd HH:mm:ss
+                False,  # keep up to date
+                [],
             )
-            
         except Exception as e:
             logger.error(f"Error requesting ATR for {ticker}: {e}")
             self.historical_data_error.emit(ticker, str(e))
-            # Clean up on error
-            if req_id in self.active_requests:
-                del self.active_requests[req_id]
-            if req_id in self.historical_data:
-                del self.historical_data[req_id]
+            self.active_requests.pop(req_id, None)
+            self.historical_data.pop(req_id, None)
+            self.ib_app.release_request_id(req_id)
                 
     def handle_historical_data(self, req_id: int, bar):
         """Handle historical data bar from IB"""
@@ -177,21 +191,12 @@ class HistoricalDataManager(QObject):
             self._cleanup_request(req_id)
             
     def _cleanup_request(self, req_id: int):
-        """Clean up request data"""
-        if req_id in self.active_requests:
-            del self.active_requests[req_id]
-        if req_id in self.historical_data:
-            del self.historical_data[req_id]
+        """Clean up request data and release the request ID."""
+        self.active_requests.pop(req_id, None)
+        self.historical_data.pop(req_id, None)
+        if self.ib_app:
+            self.ib_app.release_request_id(req_id)
             
-    def _create_stock_contract(self, symbol: str) -> Contract:
-        """Create a stock contract for the given symbol"""
-        contract = Contract()
-        contract.symbol = symbol
-        contract.secType = "STK"
-        contract.exchange = "SMART"
-        contract.currency = "USD"
-        return contract
-        
     def get_active_requests(self) -> Dict[int, Tuple[str, str]]:
         """Get active historical data requests"""
         return self.active_requests.copy()
