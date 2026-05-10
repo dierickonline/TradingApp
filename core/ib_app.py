@@ -40,6 +40,7 @@ class IBSignals(QObject):
     tick_size = pyqtSignal(int, int, int)  # reqId, tickType, size
     historical_data = pyqtSignal(int, object)  # reqId, bar
     historical_data_end = pyqtSignal(int, str, str)  # reqId, start, end
+    historical_data_update = pyqtSignal(int, object)  # reqId, bar (live updates)
     next_valid_id = pyqtSignal(int)  # orderId
     order_status = pyqtSignal(int, str, float, float, float, int, int, float, int, str, float)  # full order status
     position = pyqtSignal(str, object, float, float)  # account, contract, position, avgCost
@@ -164,6 +165,10 @@ class IBApp(EWrapper, EClient):
     def historicalDataEnd(self, reqId, start, end):
         """Handle end of historical data"""
         self.signals.historical_data_end.emit(reqId, start, end)
+
+    def historicalDataUpdate(self, reqId, bar):
+        """Handle live bar updates (only fires when keepUpToDate=True)."""
+        self.signals.historical_data_update.emit(reqId, bar)
         
     def nextValidId(self, orderId):
         """Called when connection is established with next valid order ID.

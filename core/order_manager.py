@@ -1,10 +1,27 @@
 # core/order_manager.py
 """Order manager for handling IB order operations"""
 import logging
+import math
 from PyQt6.QtCore import QObject, pyqtSignal
 from ibapi.order import Order
 
 logger = logging.getLogger(__name__)
+
+
+def _round_to_tick(price: float, min_tick: float) -> float:
+    """Snap ``price`` to the nearest multiple of ``min_tick``.
+
+    IB rejects orders whose prices aren't on the contract's tick grid
+    (error 110). FP imprecision after the divide can leave a residual
+    fractional part, so we re-round to a sensible decimal precision
+    derived from the tick (e.g. minTick=0.0001 → 4 decimals).
+    """
+    if min_tick is None or min_tick <= 0 or price <= 0:
+        return price
+    steps = round(price / min_tick)
+    snapped = steps * min_tick
+    decimals = max(0, -int(math.floor(math.log10(min_tick))))
+    return round(snapped, decimals + 2)
 
 
 class OrderManager(QObject):
@@ -106,6 +123,26 @@ class OrderManager(QObject):
             return
 
         try:
+            min_tick = None
+            if self.contract_resolver is not None:
+                getter = getattr(self.contract_resolver, 'get_min_tick', None)
+                if callable(getter):
+                    min_tick = getter(ticker)
+            if min_tick:
+                snapped_entry = _round_to_tick(entry_price, min_tick)
+                snapped_stop = _round_to_tick(stop_loss, min_tick)
+                snapped_target = _round_to_tick(take_profit, min_tick)
+                if (snapped_entry, snapped_stop, snapped_target) != (entry_price, stop_loss, take_profit):
+                    logger.info(
+                        f"Snapping {ticker} prices to minTick={min_tick}: "
+                        f"entry {entry_price}->{snapped_entry}, "
+                        f"stop {stop_loss}->{snapped_stop}, "
+                        f"target {take_profit}->{snapped_target}"
+                    )
+                entry_price = snapped_entry
+                stop_loss = snapped_stop
+                take_profit = snapped_target
+
             parent_order_id = self.get_next_order_id()
             stop_order_id = self.get_next_order_id()
             profit_order_id = self.get_next_order_id()

@@ -39,6 +39,10 @@ class MainWindow(QMainWindow):
         # Distinguishes user-initiated disconnects from unplanned drops so we
         # can warn the user only in the latter case.
         self._user_initiated_disconnect = False
+        # Open chart windows, keyed by id(window). Held to prevent garbage
+        # collection while the window is alive — the closeEvent handler emits
+        # back to us so we can drop the reference.
+        self._chart_windows: dict = {}
         self.init_ui()
         logger.info("MainWindow initialized")
         
@@ -161,6 +165,7 @@ class MainWindow(QMainWindow):
         self.trader_widget.unsubscribe_ticker.connect(self.market_data_manager.unsubscribe_market_data)
         self.trader_widget.request_atr.connect(self.historical_data_manager.request_atr)
         self.trader_widget.execute_bracket_order.connect(self.execute_bracket_order)
+        self.trader_widget.open_chart_requested.connect(self.open_chart_window)
         
         # Connect market data manager signals to trader widget
         self.market_data_manager.market_data_update.connect(self.trader_widget.update_market_data)
@@ -233,6 +238,7 @@ class MainWindow(QMainWindow):
             # Connect historical data signals
             self.signals.historical_data.connect(self.historical_data_manager.handle_historical_data)
             self.signals.historical_data_end.connect(self.historical_data_manager.handle_historical_data_end)
+            self.signals.historical_data_update.connect(self.historical_data_manager.handle_historical_data_update)
             
             # Connect order signals
             self.signals.next_valid_id.connect(self.order_manager.set_next_order_id)
@@ -373,12 +379,16 @@ class MainWindow(QMainWindow):
     def update_account_value(self, account, tag, value, currency):
         """Update account value in UI"""
         self.connection_widget.update_account_value(account, tag, value, currency)
-        
+
         # Pass available funds to trader widget for position sizing
         if tag == "AvailableFunds":
             try:
                 funds_value = float(value)
                 self.trader_widget.set_available_funds(funds_value)
+                # Keep open chart windows in sync so their position-sizing
+                # default uses the latest funds, not the value at open.
+                for window in self._chart_windows.values():
+                    window.update_risk_context(available_funds=funds_value)
             except ValueError:
                 logger.error(f"Error parsing available funds: {value}")
                 
@@ -448,10 +458,13 @@ class MainWindow(QMainWindow):
         # Pass parameters to trader widget
         if hasattr(self, 'trader_widget'):
             self.trader_widget.set_trade_confirmation(params.get('confirm_trades', True))
-            self.trader_widget.set_risk_parameters(
-                params.get('risk_reward_ratio', 2.0),
-                params.get('max_risk_percentage', 2.0)
-            )
+            rr = params.get('risk_reward_ratio', 2.0)
+            max_risk = params.get('max_risk_percentage', 2.0)
+            self.trader_widget.set_risk_parameters(rr, max_risk)
+            for window in self._chart_windows.values():
+                window.update_risk_context(
+                    max_risk_percentage=max_risk, risk_reward_ratio=rr
+                )
             
     def load_risk_parameters(self):
         """Load risk parameters on startup"""
@@ -476,8 +489,98 @@ class MainWindow(QMainWindow):
         position_tickers = set(self.position_manager.positions.keys())
         self.market_data_manager.refresh_position_subscriptions(position_tickers)
         
+    def open_chart_window(self, ticker: str):
+        """Open a 5-minute Lightweight Charts window for the given ticker.
+
+        Refuses if not connected to IB — the historical data request would
+        fail anyway, and we want a clear message rather than a silent
+        empty chart.
+        """
+        if not self.ib_app or not self.ib_app.isConnected():
+            QMessageBox.warning(
+                self,
+                "Not Connected",
+                "Connect to IB before opening a chart.",
+            )
+            return
+
+        # Snapshot the trader's risk context so the chart's position-sizing
+        # default matches the trader widget. Live updates are pushed via
+        # update_risk_context as funds / risk params change later.
+        model = self.trader_widget.trading_controls.model
+        from gui.chart_widget import ChartWindow
+        window = ChartWindow(
+            ticker, self.historical_data_manager, parent=None,
+            available_funds=model.available_funds,
+            max_risk_percentage=model.max_risk_percentage,
+            risk_reward_ratio=model.risk_reward_ratio,
+        )
+        window.closed.connect(self._on_chart_window_closed)
+        window.submit_bracket_order.connect(self._on_chart_submit_bracket_order)
+        self._chart_windows[id(window)] = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_chart_window_closed(self, window):
+        """Drop the reference so the window can be garbage-collected."""
+        self._chart_windows.pop(id(window), None)
+
+    def _on_chart_submit_bracket_order(self, order_data: dict):
+        """Confirm and submit a bracket order originated from a chart window.
+
+        The chart already validates ordering (long: stop<entry<target,
+        short: stop>entry>target) and a positive quantity, so we treat the
+        payload as well-formed and just verify the fields parse cleanly
+        before showing the user a confirmation dialog.
+        """
+        try:
+            ticker = str(order_data['ticker']).upper()
+            action = str(order_data['action']).upper()
+            entry = float(order_data['entry'])
+            stop = float(order_data['stop'])
+            target = float(order_data['target'])
+            quantity = int(order_data['quantity'])
+            entry_order_type = str(order_data.get('entry_order_type', 'LMT'))
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Chart order payload invalid: {e} -- {order_data}")
+            QMessageBox.warning(
+                self, "Invalid Order", "Order data from the chart was invalid."
+            )
+            return
+
+        if action not in ("BUY", "SELL") or quantity <= 0 or entry <= 0:
+            QMessageBox.warning(
+                self, "Invalid Order", "Action / quantity / entry are out of range."
+            )
+            return
+
+        msg = (
+            f"Submit {action} bracket order from chart?\n\n"
+            f"Ticker: {ticker}\n"
+            f"Entry ({entry_order_type}): ${entry:.2f}\n"
+            f"Stop Loss: ${stop:.2f}\n"
+            f"Take Profit: ${target:.2f}\n"
+            f"Quantity: {quantity} shares"
+        )
+        reply = QMessageBox.question(
+            self, "Confirm Bracket Order", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.execute_bracket_order(
+            ticker, action, entry, stop, target, quantity,
+            entry_order_type, 0.0,
+        )
+
     def closeEvent(self, event):
         """Handle window close event"""
+        # Close any open chart windows so their IB requests are cancelled
+        # before we tear down the connection.
+        for window in list(self._chart_windows.values()):
+            window.close()
         self.disconnect_from_ib()
         if hasattr(self.connection_widget, 'cleanup'):
             self.connection_widget.cleanup()

@@ -18,7 +18,8 @@ class TickerInputSection(QGroupBox):
     
     subscribe_clicked = pyqtSignal(str)
     unsubscribe_clicked = pyqtSignal()
-    
+    chart_clicked = pyqtSignal(str)  # ticker entered/selected at click time
+
     def __init__(self, parent=None):
         super().__init__("Ticker Selection", parent)
         self.init_ui()
@@ -76,11 +77,18 @@ class TickerInputSection(QGroupBox):
         self.unsubscribe_btn.setEnabled(False)
         self.unsubscribe_btn.setStyleSheet(self.get_button_style("#f44336", "#da190b"))
         self.unsubscribe_btn.clicked.connect(self.on_unsubscribe)
-        
+
+        # Chart button — opens a 5-min Lightweight Charts window for the
+        # currently entered ticker (or the active subscription).
+        self.chart_btn = QPushButton("Chart")
+        self.chart_btn.setStyleSheet(self.get_button_style("#2196F3", "#1976D2"))
+        self.chart_btn.clicked.connect(self.on_chart)
+
         controls_layout.addWidget(QLabel("Ticker Symbol:"))
         controls_layout.addWidget(self.ticker_input)
         controls_layout.addWidget(self.subscribe_btn)
         controls_layout.addWidget(self.unsubscribe_btn)
+        controls_layout.addWidget(self.chart_btn)
         controls_layout.addStretch()
         
         layout.addLayout(controls_layout)
@@ -122,6 +130,12 @@ class TickerInputSection(QGroupBox):
     def on_unsubscribe(self):
         """Handle unsubscribe"""
         self.unsubscribe_clicked.emit()
+
+    def on_chart(self):
+        """Open a chart for the entered ticker."""
+        ticker = self.ticker_input.text().strip().upper()
+        if ticker:
+            self.chart_clicked.emit(ticker)
         
     def set_subscribed(self, subscribed: bool, ticker: str = ""):
         """Update UI for subscription state"""
@@ -602,6 +616,7 @@ class TraderWidget(QWidget):
     unsubscribe_ticker = pyqtSignal(str)
     request_atr = pyqtSignal(str)
     execute_bracket_order = pyqtSignal(str, str, float, float, float, int, str, float)  # Added entry_order_type, trailing_percent
+    open_chart_requested = pyqtSignal(str)  # ticker
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -667,6 +682,7 @@ class TraderWidget(QWidget):
         # Ticker section
         self.ticker_section.subscribe_clicked.connect(self.on_subscribe)
         self.ticker_section.unsubscribe_clicked.connect(self.on_unsubscribe)
+        self.ticker_section.chart_clicked.connect(self.open_chart_requested)
         
         # Trading controls
         self.trading_controls.execute_order.connect(self.on_execute_order)

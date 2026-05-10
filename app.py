@@ -2,6 +2,11 @@
 import sys
 import logging
 import traceback
+# QtWebEngine must be imported *before* the QApplication is constructed —
+# it sets up the OpenGL context sharing the embedded chart needs. The
+# import is lightweight; the actual web view is only built when the user
+# opens a chart window.
+import PyQt6.QtWebEngineWidgets  # noqa: F401
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from gui.main_window import MainWindow
 from logging_config import setup_logging

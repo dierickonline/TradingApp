@@ -32,6 +32,7 @@ class ContractResolver(QObject):
         super().__init__()
         self.ib_app = ib_app
         self._cache: Dict[str, str] = {}
+        self._min_tick: Dict[str, float] = {}
         self._pending: Dict[int, dict] = {}
         self._symbol_to_req: Dict[str, int] = {}
 
@@ -62,6 +63,7 @@ class ContractResolver(QObject):
         self._pending[req_id] = {
             'symbol': symbol,
             'primary_exchange': None,
+            'min_tick': None,
             'callbacks': [callback],
         }
         self._symbol_to_req[symbol] = req_id
@@ -85,9 +87,10 @@ class ContractResolver(QObject):
             return
         primary = getattr(contract_details.contract, 'primaryExchange', '') or ''
         exchange = getattr(contract_details.contract, 'exchange', '') or ''
+        min_tick = getattr(contract_details, 'minTick', None)
         logger.info(
             f"contractDetails for {entry['symbol']}: "
-            f"exchange={exchange!r} primaryExchange={primary!r}"
+            f"exchange={exchange!r} primaryExchange={primary!r} minTick={min_tick!r}"
         )
         # IB normally returns one row for a USD STK; if more arrive, we trust
         # the first non-empty primaryExchange.
@@ -95,6 +98,8 @@ class ContractResolver(QObject):
             return
         if primary:
             entry['primary_exchange'] = primary
+        if entry['min_tick'] is None and isinstance(min_tick, (int, float)) and min_tick > 0:
+            entry['min_tick'] = float(min_tick)
 
     def handle_contract_details_end(self, req_id: int) -> None:
         entry = self._pending.pop(req_id, None)
@@ -106,7 +111,12 @@ class ContractResolver(QObject):
 
         if primary:
             self._cache[symbol] = primary
-            logger.info(f"Resolved {symbol} -> primaryExchange={primary}")
+            if entry['min_tick'] is not None:
+                self._min_tick[symbol] = entry['min_tick']
+            logger.info(
+                f"Resolved {symbol} -> primaryExchange={primary} "
+                f"minTick={self._min_tick.get(symbol)}"
+            )
             contract = self._build_contract(symbol, primary)
             self._dispatch(entry['callbacks'], contract, None)
         else:
@@ -134,6 +144,11 @@ class ContractResolver(QObject):
         """Drop in-flight requests and the resolved cache."""
         self.cancel_pending()
         self._cache.clear()
+        self._min_tick.clear()
+
+    def get_min_tick(self, symbol: str) -> Optional[float]:
+        """Return the cached minTick for ``symbol``, or None if unknown."""
+        return self._min_tick.get(symbol)
 
     def _fail(self, req_id: int, error: str) -> None:
         entry = self._pending.pop(req_id, None)
